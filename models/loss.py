@@ -10,7 +10,7 @@ class GreeksInformedLoss(nn.Module):
             theta_floor_base: float = -0.03,
             theta_floor_slope: float = 0.0393,
             theta_floor_eps: float = 1e-4,
-            delta_ceiling: float = 0.9999,
+            delta_ceiling: float = 1.0,
             price_spot_margin: float = 1e-4,
             w_delta: float = 1.0,
             w_delta_upper: float = 1.0,
@@ -97,7 +97,9 @@ class GreeksInformedLoss(nn.Module):
 
         call_prices = pred * k
 
-        price_loss = self._masked_mean(self.price_loss(call_prices, y_true), loss_mask)
+        weight = 1.0 / (torch.abs(delta.detach()) + self.theta_floor_eps)
+        weight = torch.clamp(weight, max=10.0)
+        price_loss = self._masked_mean(torch.abs(call_prices - y_true) * weight, loss_mask)
 
         # Normalize theta to K
         theta_normalized = theta / torch.clamp(k, min=1e-8)

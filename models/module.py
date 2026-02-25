@@ -4,6 +4,7 @@ import torch
 import lightning as pl
 from torch.optim import Adam
 import torch.nn as nn
+from pytorch_optimizer import SOAP
 
 from models.loss import GreeksInformedLoss
 from models.net import SurfaceTransformerNet
@@ -200,7 +201,7 @@ class SurfaceTransformerOptionModule(pl.LightningModule):
         return self._shared_step(batch, stage="test")
 
     def configure_optimizers(self):
-        optimizer = Adam(self.parameters(), lr=self.hparams.learning_rate)
+        optimizer = SOAP(self.parameters(), lr=self.hparams.learning_rate)#Adam(self.parameters(), lr=self.hparams.learning_rate)
         scheduler = CosineAnnealingLR(optimizer, T_max=self.epochs)#StepLR(optimizer, step_size=10, gamma=0.95)
         return [optimizer], [scheduler]
 
