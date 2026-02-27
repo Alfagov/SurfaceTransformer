@@ -8,14 +8,13 @@ import lightning as pl
 from models.dataset import SurfaceOptionsDataModule
 from models.module import SurfaceTransformerOptionModule, export_surface_model_to_onnx
 
-lr = 2e-4
-EPOCHS = 1500
-batch_size = 4196
+lr = 3e-4
+EPOCHS = 400
 LAMBDA_ARB = 10.0
 
-dates_per_batch = 16
-context_size = 64
-query_size = 64
+dates_per_batch = 24
+context_size = 128
+query_size = 128
 
 if __name__ == '__main__':
     torch.manual_seed(42)

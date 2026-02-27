@@ -41,4 +41,3 @@ def _build_surface_example_input(
 
     return query_x, context_x, context_y, context_mask
 
-

@@ -26,6 +26,15 @@ class SurfaceTransformerNet(nn.Module):
             dropout=dropout,
             price_log_eps=price_log_eps,
         )
+
+        query_feat_dim = 1 + 1 + 1 + (raw_input_dim - 4)
+        self.cross_attn = SurfaceCrossAttentionBlock(
+            query_dim=query_feat_dim,
+            d_model=d_model,
+            n_heads=n_heads,
+            dropout=dropout
+        )
+
         self.price_head = SurfacePriceHead(
             raw_input_dim=raw_input_dim,
             d_model=d_model,
@@ -56,7 +65,7 @@ class SurfaceTransformerNet(nn.Module):
             context_y: torch.Tensor,
             context_mask: torch.Tensor,
     ):
-        z_date = self.encoder(context_x=context_x, context_y=context_y, context_mask=context_mask)
+        context_memory = self.encoder(context_x=context_x, context_y=context_y, context_mask=context_mask)
 
         with torch.enable_grad():
             query_xg = query_x.detach().requires_grad_(True)
@@ -65,14 +74,22 @@ class SurfaceTransformerNet(nn.Module):
             t = query_xg[:, :, 2:3]
             v = query_xg[:, :, 3:4]
             rest = query_xg[:, :, 4:]
+
             log_m, sqrt_t = self.engineer_surface_features(s=s, k=k, t=t)
+
+            query_feats = torch.cat([log_m, sqrt_t, v, rest], dim=-1)
+            context_features = self.cross_attn(
+                query_features=query_feats,
+                context_memory=context_memory,
+                context_mask=context_mask
+            )
 
             log_price_norm = self.price_head(
                 log_m=log_m,
                 sqrt_t=sqrt_t,
                 v=v,
                 rest=rest,
-                z_date=z_date,
+                context_features=context_features,
             )
             normalized_prices = self.decode_log_price_norm(log_price_norm=log_price_norm)
             prices = normalized_prices * k
@@ -114,10 +131,61 @@ class SurfaceTransformerNet(nn.Module):
         }
         return normalized_prices, greeks
 
+class SurfaceCrossAttentionBlock(nn.Module):
+    def __init__(self,
+                 query_dim: int,
+                 d_model: int,
+                 n_heads: int,
+                 dropout: float = 0.1
+                 ):
+        super().__init__()
+        self.query_proj = nn.Linear(query_dim, d_model)
+        self.mha = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4 , d_model),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self,
+                query_features: torch.Tensor,
+                context_memory: torch.Tensor,
+                context_mask: torch.Tensor
+                ) -> torch.Tensor:
+        q = self.query_proj(query_features)
+
+        key_padding_mask = ~context_mask.bool()
+
+
+        attn_out, _ = self.mha(
+            query=q,
+            key=context_memory,
+            value=context_memory,
+            key_padding_mask=key_padding_mask,
+            need_weights=False
+        )
+
+        x = self.norm1(q + attn_out)
+
+        ffn_out = self.ffn(x)
+        x = self.norm2(x + ffn_out)
+
+        return x
+
 class SurfaceEncoderTransformer(nn.Module):
     def __init__(
             self,
-            token_dim: int = 6,
+            token_dim: int = 7,
             d_model: int = 128,
             n_heads: int = 4,
             n_layers: int = 4,
@@ -160,16 +228,13 @@ class SurfaceEncoderTransformer(nn.Module):
         tokens = self.token_projection(token_input)
         padding_mask = ~context_mask.bool()
         encoded = self.encoder(tokens, src_key_padding_mask=padding_mask)
-
-        mask = context_mask.unsqueeze(-1).to(dtype=encoded.dtype)
-        pooled = (encoded * mask).sum(dim=1) / torch.clamp(mask.sum(dim=1), min=1.0)
-        return pooled
+        return encoded
 
 
 class SurfacePriceHead(nn.Module):
     def __init__(
             self,
-            raw_input_dim: int = 6,
+            raw_input_dim: int = 7,
             d_model: int = 128,
             head_hidden: int = 256,
             price_log_eps: float = 1e-6,
@@ -193,8 +258,7 @@ class SurfacePriceHead(nn.Module):
             sqrt_t: torch.Tensor,
             v: torch.Tensor,
             rest: torch.Tensor,
-            z_date: torch.Tensor,
+            context_features: torch.Tensor,
     ) -> torch.Tensor:
-        z_expanded = z_date.unsqueeze(1).expand(-1, log_m.shape[1], -1)
-        model_input = torch.cat([log_m, sqrt_t, v, rest, z_expanded], dim=-1)
+        model_input = torch.cat([log_m, sqrt_t, v, rest, context_features], dim=-1)
         return self.model(model_input)

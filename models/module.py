@@ -32,6 +32,9 @@ class SurfaceTransformerOptionModule(pl.LightningModule):
             w_delta_upper: float = 1.0,
             w_theta_upper: float = 1.0,
             w_price_upper: float = 1.0,
+            w_delta_target: float = 1.0,
+            w_gamma_target: float = 1.0,
+            w_theta_target: float = 1.0,
             vega_weight_eps: float = 1e-8,
             huber_delta: float = 1.0,
             learning_rate: float = 1e-3,
@@ -64,6 +67,9 @@ class SurfaceTransformerOptionModule(pl.LightningModule):
             w_delta_upper=w_delta_upper,
             w_theta_upper=w_theta_upper,
             w_price_upper=w_price_upper,
+            w_delta_target=w_delta_target,
+            w_gamma_target=w_gamma_target,
+            w_theta_target=w_theta_target,
             vega_weight_eps=vega_weight_eps,
             huber_delta=huber_delta,
         )
@@ -102,6 +108,7 @@ class SurfaceTransformerOptionModule(pl.LightningModule):
     def _shared_step(self, batch, stage: str):
         query_x = batch["query_x"]
         query_y = batch["query_y"]
+        query_greeks = batch["query_greeks"]
         query_mask = batch.get("query_mask")
         context_x = batch["context_x"]
         context_y = batch["context_y"]
@@ -116,7 +123,15 @@ class SurfaceTransformerOptionModule(pl.LightningModule):
         t = query_x[:, :, 2:3]
         s = query_x[:, :, 0:1]
         k = query_x[:, :, 1:2]
-        loss_dict = self.loss_fn(y_pred, query_y, t=t, s=s, k=k, sample_mask=query_mask)
+        loss_dict = self.loss_fn(
+            y_pred,
+            query_y,
+            t=t,
+            s=s,
+            k=k,
+            target_greeks=query_greeks,
+            sample_mask=query_mask,
+        )
         loss_dict["loss"] = self._guard_finite(loss_dict["loss"])
 
         self.log(f"{stage}_loss", loss_dict["loss"], on_step=True, on_epoch=True, prog_bar=True, logger=True)
@@ -180,6 +195,30 @@ class SurfaceTransformerOptionModule(pl.LightningModule):
             prog_bar=False,
             logger=True,
         )
+        self.log(
+            f"{stage}_delta_target_loss",
+            loss_dict["delta_target_loss"],
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+        )
+        self.log(
+            f"{stage}_gamma_target_loss",
+            loss_dict["gamma_target_loss"],
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+        )
+        self.log(
+            f"{stage}_theta_target_loss",
+            loss_dict["theta_target_loss"],
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+        )
 
         return loss_dict
 
@@ -222,22 +261,25 @@ def export_surface_model_to_onnx(
     context_mask = context_mask.detach().cpu()
 
     with torch.no_grad():
+        batch_dim = torch.export.Dim("batch")
+        query_points_dim = torch.export.Dim("query_points")
+        context_points_dim = torch.export.Dim("context_points")
         torch.onnx.export(
             export_model,
             (query_x, context_x, context_y, context_mask),
             str(onnx_path),
             export_params=True,
             do_constant_folding=True,
+            dynamo=True,
             opset_version=ONNX_OPSET_VERSION,
             input_names=["query_x", "context_x", "context_y", "context_mask"],
             output_names=["predicted_price"],
-            dynamic_axes={
-                "query_x": {0: "batch", 1: "query_points"},
-                "context_x": {0: "batch", 1: "context_points"},
-                "context_y": {0: "batch", 1: "context_points"},
-                "context_mask": {0: "batch", 1: "context_points"},
-                "predicted_price": {0: "batch", 1: "query_points"},
-            },
+            dynamic_shapes=(
+                {0: batch_dim, 1: query_points_dim},
+                {0: batch_dim, 1: context_points_dim},
+                {0: batch_dim, 1: context_points_dim},
+                {0: batch_dim, 1: context_points_dim},
+            ),
         )
 
     return onnx_path
@@ -256,7 +298,7 @@ class SurfacePriceExportWrapper(nn.Module):
             context_y: torch.Tensor,
             context_mask: torch.Tensor,
     ) -> torch.Tensor:
-        z_date = self.surface_model.encoder(
+        context_memory = self.surface_model.encoder(
             context_x=context_x,
             context_y=context_y,
             context_mask=context_mask,
@@ -269,12 +311,19 @@ class SurfacePriceExportWrapper(nn.Module):
         rest = query_x[:, :, 4:]
         log_m, sqrt_t = self.surface_model.engineer_surface_features(s=s, k=k, t=t)
 
+        query_feats = torch.cat([log_m, sqrt_t, v, rest], dim=-1)
+        context_features = self.surface_model.cross_attn(
+            query_features=query_feats,
+            context_memory=context_memory,
+            context_mask=context_mask
+        )
+
         log_price_norm = self.surface_model.price_head(
             log_m=log_m,
             sqrt_t=sqrt_t,
             v=v,
             rest=rest,
-            z_date=z_date,
+            context_features=context_features,
         )
         normalized_prices = self.surface_model.decode_log_price_norm(log_price_norm=log_price_norm)
         return normalized_prices * k

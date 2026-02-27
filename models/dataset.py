@@ -7,6 +7,7 @@ import numpy as np
 import polars as pl
 
 SURFACE_FEATURE_COLUMNS = ["S", "K", "T", "vix", "dividend_yield", "rate"]
+GREEK_LABEL_COLUMNS = ["delta", "gamma", "theta"]
 
 class SurfaceOptionsDataModule(l.LightningDataModule):
     def __init__(
@@ -40,14 +41,7 @@ class SurfaceOptionsDataModule(l.LightningDataModule):
         if n_dates < 3:
             raise ValueError(f"Need at least 3 unique dates for train/val/test split, got {n_dates}.")
 
-        train_date_count = max(1, int(n_dates * 0.90))
-        test_date_count = max(1, int(n_dates * 0.1))
-
-        if train_date_count + test_date_count >= n_dates:
-            if test_date_count > 1:
-                test_date_count -= 1
-            else:
-                train_date_count = max(1, train_date_count - 1)
+        train_date_count = max(1, int(n_dates * 0.85))
 
         train_dates = unique_dates[:train_date_count]
         test_dates = unique_dates[train_date_count:]
@@ -58,6 +52,7 @@ class SurfaceOptionsDataModule(l.LightningDataModule):
     def _group_by_date(frame: pl.DataFrame):
         x_by_date = []
         y_by_date = []
+        greek_labels_by_date = []
 
         frame = frame.with_columns(date_only=pl.col("date").dt.date())
 
@@ -67,14 +62,21 @@ class SurfaceOptionsDataModule(l.LightningDataModule):
 
             x = group.select(SURFACE_FEATURE_COLUMNS).to_torch(dtype=pl.Float32)
             y = group.select("Price").to_torch(dtype=pl.Float32)
+            greek_labels = (
+                group
+                .select(GREEK_LABEL_COLUMNS)
+                .with_columns((pl.col("theta") * 365.0).alias("theta"))
+                .to_torch(dtype=pl.Float32)
+            )
 
             x_by_date.append(x)
             y_by_date.append(y)
+            greek_labels_by_date.append(greek_labels)
 
         if not x_by_date:
             raise ValueError("No date groups remain after preprocessing.")
 
-        return x_by_date, y_by_date
+        return x_by_date, y_by_date, greek_labels_by_date
 
     def setup(self, stage: str) -> None:
         if self.train is not None and self.test is not None:
@@ -97,10 +99,10 @@ class SurfaceOptionsDataModule(l.LightningDataModule):
             vix=pl.col("vix") / 100.0,
             T=pl.col("T") / 365.0
         ).filter(
-            (pl.col("M") >= 0.5) & (pl.col("M") <= 1.15)
+            (pl.col("M") >= 0.7) & (pl.col("M") <= 1.15)
         )
 
-        base_required = ["date", "Price", "S", "K", "T", "vix", "dividend_yield", "rate"]
+        base_required = ["date", "Price", "S", "K", "T", "vix", "dividend_yield", "rate", "delta", "gamma", "theta"]
         lf = lf.drop_nulls(subset=base_required)
 
         final_df = lf.collect().sort("date")
@@ -111,17 +113,17 @@ class SurfaceOptionsDataModule(l.LightningDataModule):
         train_df = final_df.filter(date_expr.is_in(train_dates))
         test_df = final_df.filter(date_expr.is_in(test_dates))
 
-        train_x, train_y = self._group_by_date(train_df)
-        test_x, test_y = self._group_by_date(test_df)
+        train_x, train_y, train_greeks = self._group_by_date(train_df)
+        test_x, test_y, test_greeks = self._group_by_date(test_df)
 
         self.train = DateGroupedOptionsDataset(
-            train_x, train_y,
+            train_x, train_y, train_greeks,
             context_size=self.context_size, query_size=self.query_size,
             deterministic=False, seed=self.seed,
         )
 
         self.test = DateGroupedOptionsDataset(
-            test_x, test_y,
+            test_x, test_y, test_greeks,
             context_size=self.context_size, query_size=self.query_size,
             deterministic=True, seed=self.seed + 20_000,
         )
@@ -155,13 +157,17 @@ class DateGroupedOptionsDataset(Dataset):
             self,
             x_by_date: List[torch.Tensor],
             y_by_date: List[torch.Tensor],
+            greek_labels_by_date: List[torch.Tensor],
             context_size: int,
             query_size: int,
             deterministic: bool = False,
             seed: int = 42,
     ):
+        if not (len(x_by_date) == len(y_by_date) == len(greek_labels_by_date)):
+            raise ValueError("x_by_date, y_by_date, and greek_labels_by_date must have the same length.")
         self.x_by_date = x_by_date
         self.y_by_date = y_by_date
+        self.greek_labels_by_date = greek_labels_by_date
         self.context_size = context_size
         self.query_size = query_size
         self.deterministic = deterministic
@@ -225,6 +231,7 @@ class DateGroupedOptionsDataset(Dataset):
     def __getitem__(self, item: int):
         x = self.x_by_date[item]
         y = self.y_by_date[item]
+        greek_labels = self.greek_labels_by_date[item]
         row_count = x.shape[0]
         if row_count == 0:
             raise ValueError(f"Date-group at index {item} has no rows.")
@@ -239,12 +246,18 @@ class DateGroupedOptionsDataset(Dataset):
         context_y, _ = self._pad_selected_rows(y, context_idx_t, self.context_size)
         query_x, query_mask = self._pad_selected_rows(x, query_idx_t, self.query_size)
         query_y, _ = self._pad_selected_rows(y, query_idx_t, self.query_size)
+        query_greek_labels, _ = self._pad_selected_rows(greek_labels, query_idx_t, self.query_size)
 
         return {
             "context_x": context_x,
             "context_y": context_y,
             "query_x": query_x,
             "query_y": query_y,
+            "query_greeks": {
+                "delta": query_greek_labels[:, 0:1],
+                "gamma": query_greek_labels[:, 1:2],
+                "theta": query_greek_labels[:, 2:3],
+            },
             "context_mask": context_mask,
             "query_mask": query_mask,
         }

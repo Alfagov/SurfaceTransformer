@@ -20,6 +20,9 @@ class GreeksInformedLoss(nn.Module):
             w_theta_upper: float = 1.0,
             w_dual_gamma: float = 1.0,
             w_price_upper: float = 1.0,
+            w_delta_target: float = 1.0,
+            w_gamma_target: float = 1.0,
+            w_theta_target: float = 1.0,
             vega_weight_eps: float = 1e-8,
             huber_delta: float = 1.0,
     ):
@@ -43,7 +46,39 @@ class GreeksInformedLoss(nn.Module):
         self.w_theta_upper = w_theta_upper
         self.w_dual_gamma = w_dual_gamma
         self.w_price_upper = w_price_upper
+        self.w_delta_target = w_delta_target
+        self.w_gamma_target = w_gamma_target
+        self.w_theta_target = w_theta_target
         self.vega_weight_eps = vega_weight_eps
+
+    @staticmethod
+    def _validate_and_flatten_target_greeks(
+            target_greeks: Dict[str, torch.Tensor],
+            reference: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        required_keys = ("delta", "gamma", "theta")
+        missing_keys = [key for key in required_keys if key not in target_greeks]
+        if missing_keys:
+            raise ValueError(
+                f"target_greeks is missing required keys: {missing_keys}. "
+                f"Expected keys: {list(required_keys)}."
+            )
+
+        flattened: Dict[str, torch.Tensor] = {}
+        for key in required_keys:
+            value = target_greeks[key]
+            if not torch.is_tensor(value):
+                raise TypeError(f"target_greeks['{key}'] must be a torch.Tensor, got {type(value).__name__}.")
+
+            value_flat = value.reshape(-1, 1)
+            if value_flat.shape != reference.shape:
+                raise ValueError(
+                    f"target_greeks['{key}'] has flattened shape {tuple(value_flat.shape)}, "
+                    f"but expected {tuple(reference.shape)}."
+                )
+            flattened[key] = value_flat
+
+        return flattened
 
     @staticmethod
     def _flatten_column(x: torch.Tensor) -> torch.Tensor:
@@ -78,6 +113,7 @@ class GreeksInformedLoss(nn.Module):
             t: torch.Tensor,
             s: torch.Tensor,
             k: torch.Tensor,
+            target_greeks: Dict[str, torch.Tensor],
             sample_mask: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
 
@@ -89,11 +125,16 @@ class GreeksInformedLoss(nn.Module):
         k = self._sanitize_tensor(self._flatten_column(k))
         loss_mask = self._build_loss_mask(pred, sample_mask)
 
+        flattened_target_greeks = self._validate_and_flatten_target_greeks(target_greeks, reference=pred)
+
         delta = self._sanitize_tensor(self._flatten_column(greeks["delta"]))
         dual_delta = self._sanitize_tensor(self._flatten_column(greeks["dual_delta"]))
         gamma = self._sanitize_tensor(self._flatten_column(greeks["gamma"]))
         theta = self._sanitize_tensor(self._flatten_column(greeks["theta"]))
         dual_gamma = self._sanitize_tensor(self._flatten_column(greeks["dual_gamma"]))
+        delta_target = self._sanitize_tensor(flattened_target_greeks["delta"])
+        gamma_target = self._sanitize_tensor(flattened_target_greeks["gamma"])
+        theta_target = self._sanitize_tensor(flattened_target_greeks["theta"])
 
         call_prices = pred * k
 
@@ -103,6 +144,7 @@ class GreeksInformedLoss(nn.Module):
 
         # Normalize theta to K
         theta_normalized = theta / torch.clamp(k, min=1e-8)
+        theta_target_normalized = theta_target / torch.clamp(k, min=1e-8)
 
         # Calculate the theta floor based on Time-to-Maturity
         theta_floor = self.theta_floor_base - self.theta_floor_slope / torch.sqrt(
@@ -120,6 +162,10 @@ class GreeksInformedLoss(nn.Module):
         theta_upper_loss = self._masked_mean(torch.relu(theta).pow(2), loss_mask)
         dual_gamma_loss = self._masked_mean(torch.relu(-dual_gamma).pow(2), loss_mask)
 
+        delta_target_loss = self._masked_mean((delta - delta_target).pow(2), loss_mask)
+        gamma_target_loss = self._masked_mean((gamma - gamma_target).pow(2), loss_mask)
+        theta_target_loss = self._masked_mean((theta_normalized - theta_target_normalized).pow(2), loss_mask)
+
         # Call cannot cost more than the underlying asset
         price_upper_loss = self._masked_mean(
             torch.relu(call_prices - (s - self.price_spot_margin)).pow(2),
@@ -135,6 +181,9 @@ class GreeksInformedLoss(nn.Module):
             + self.w_theta_upper * theta_upper_loss
             + self.w_dual_gamma * dual_gamma_loss
             + self.w_price_upper * price_upper_loss
+            + self.w_delta_target * delta_target_loss
+            + self.w_gamma_target * gamma_target_loss
+            + self.w_theta_target * theta_target_loss
         )
 
         total_loss = price_loss + self.lambda_arb * greek_penalty
@@ -151,5 +200,8 @@ class GreeksInformedLoss(nn.Module):
             "dual_delta_loss": dual_delta_loss,
             "dual_gamma_loss": dual_gamma_loss,
             "price_upper_loss": price_upper_loss,
+            "delta_target_loss": delta_target_loss,
+            "gamma_target_loss": gamma_target_loss,
+            "theta_target_loss": theta_target_loss,
             "theta_floor_mean": self._masked_mean(theta_floor, loss_mask),
         }
