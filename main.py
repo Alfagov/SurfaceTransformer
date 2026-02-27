@@ -9,7 +9,7 @@ from models.dataset import SurfaceOptionsDataModule
 from models.module import SurfaceTransformerOptionModule, export_surface_model_to_onnx
 
 lr = 3e-4
-EPOCHS = 400
+EPOCHS = 300
 LAMBDA_ARB = 10.0
 
 dates_per_batch = 24
@@ -59,19 +59,19 @@ if __name__ == '__main__':
         epochs=EPOCHS
     )
 
-    onnx_path = export_surface_model_to_onnx(
-        surface_module=model,
-        checkpoint_dir=checkpoint_dir,
-        run_id=run_id,
-    )
+    # onnx_path = export_surface_model_to_onnx(
+    #     surface_module=model,
+    #     checkpoint_dir=checkpoint_dir,
+    #     run_id=run_id,
+    # )
 
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
     logger = WandbLogger(project="surfaces", log_model="all")
     logger.watch(model, log_graph=True, log="all")
 
     trainer = pl.Trainer(
-        max_epochs=EPOCHS,
         accelerator="auto",
+        max_epochs=EPOCHS,
         devices=1,
         enable_progress_bar=True,
         gradient_clip_val=1.0,

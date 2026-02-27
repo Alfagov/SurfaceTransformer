@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+from rational.torch import Rational
 from models.utils import _surface_log_m_and_sqrt_t, _decode_log_price_norm
 
 class SurfaceTransformerNet(nn.Module):
@@ -35,12 +35,22 @@ class SurfaceTransformerNet(nn.Module):
             dropout=dropout
         )
 
-        self.price_head = SurfacePriceHead(
+        # self.price_head = SurfacePriceHead(
+        #     raw_input_dim=raw_input_dim,
+        #     d_model=d_model,
+        #     head_hidden=head_hidden,
+        #     price_log_eps=price_log_eps,
+        #     log_price_clip_max=log_price_clip_max,
+        # )
+
+        self.price_head = SurfaceMoEMoneynessHead(
             raw_input_dim=raw_input_dim,
             d_model=d_model,
             head_hidden=head_hidden,
+            num_experts = 3,
             price_log_eps=price_log_eps,
             log_price_clip_max=log_price_clip_max,
+            gate_temperature=1.0,
         )
 
     @staticmethod
@@ -94,9 +104,9 @@ class SurfaceTransformerNet(nn.Module):
             normalized_prices = self.decode_log_price_norm(log_price_norm=log_price_norm)
             prices = normalized_prices * k
 
-            delta, dual_delta, theta, vega = torch.autograd.grad(
+            delta, dual_delta, theta = torch.autograd.grad(
                 outputs=prices,
-                inputs=[s, k, t, v],
+                inputs=[s, k, t],
                 grad_outputs=torch.ones_like(prices),
                 create_graph=True,
                 retain_graph=True,
@@ -127,7 +137,6 @@ class SurfaceTransformerNet(nn.Module):
             "gamma": gamma,
             "dual_gamma": dual_gamma,
             "theta": -theta,
-            "vega": vega,
         }
         return normalized_prices, greeks
 
@@ -246,9 +255,9 @@ class SurfacePriceHead(nn.Module):
         engineered_dim = 1 + 1 + 1 + (raw_input_dim - 4)
         self.model = nn.Sequential(
             nn.Linear(engineered_dim + d_model, head_hidden),
-            nn.SiLU(),
+            nn.Softplus(),
             nn.Linear(head_hidden, head_hidden),
-            nn.SiLU(),
+            nn.Softplus(),
             nn.Linear(head_hidden, 1),
         )
 
@@ -262,3 +271,60 @@ class SurfacePriceHead(nn.Module):
     ) -> torch.Tensor:
         model_input = torch.cat([log_m, sqrt_t, v, rest, context_features], dim=-1)
         return self.model(model_input)
+
+class SurfaceMoEMoneynessHead(nn.Module):
+    def __init__(
+            self,
+            raw_input_dim: int = 7,
+            d_model: int = 128,
+            head_hidden: int = 256,
+            num_experts: int = 3,  # e.g., ITM, ATM, OTM
+            price_log_eps: float = 1e-6,
+            log_price_clip_max: float = 20.0,
+            gate_temperature: float = 1.0,
+    ):
+        super().__init__()
+        self.price_log_eps = price_log_eps
+        self.log_price_clip_max = log_price_clip_max
+        self.num_experts = num_experts
+        self.gate_temperature = gate_temperature
+
+        engineered_dim = 1 + 1 + 1 + (raw_input_dim - 4)
+        input_dim = engineered_dim + d_model
+
+        self.gate = nn.Sequential(
+            nn.Linear(1, head_hidden // 2),
+            nn.Tanh(),
+            nn.Linear(head_hidden // 2, num_experts)
+        )
+
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(input_dim, head_hidden),
+                nn.SiLU(),
+                nn.Linear(head_hidden, head_hidden),
+                nn.SiLU(),
+                nn.Linear(head_hidden, 1),
+            ) for _ in range(num_experts)
+        ])
+
+    def forward(
+            self,
+            log_m: torch.Tensor,
+            sqrt_t: torch.Tensor,
+            v: torch.Tensor,
+            rest: torch.Tensor,
+            context_features: torch.Tensor,
+    ) -> torch.Tensor:
+
+        gate_logits = self.gate(log_m)
+        gate_weights = nn.functional.softmax(gate_logits / self.gate_temperature, dim=-1)
+
+        model_input = torch.cat([log_m, sqrt_t, v, rest, context_features], dim=-1)
+        expert_outputs = torch.cat([
+            expert(model_input) for expert in self.experts
+        ], dim=-1)
+
+        blended_output = torch.sum(gate_weights * expert_outputs, dim=-1, keepdim=True)
+
+        return blended_output
