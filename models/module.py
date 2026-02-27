@@ -2,7 +2,7 @@ from pathlib import Path
 
 import torch
 import lightning as pl
-from torch.optim import Adam
+from torch.optim import Adam, AdamW
 import torch.nn as nn
 from pytorch_optimizer import SOAP
 
@@ -45,6 +45,7 @@ class SurfaceTransformerOptionModule(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.epochs = epochs
+
 
         self.model = SurfaceTransformerNet(
             raw_input_dim=raw_input_dim,

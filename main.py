@@ -12,7 +12,7 @@ lr = 3e-4
 EPOCHS = 300
 LAMBDA_ARB = 10.0
 
-dates_per_batch = 24
+dates_per_batch = 16
 context_size = 128
 query_size = 128
 
